@@ -23,14 +23,8 @@
 //! `chat_template`, `continue_final_message`, `documents`.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::sync::mpsc;
 
-use affordance::emit::{Encoder, RunCache};
-use affordance::value::{Map, Value};
-use affordance::{View, state_from_json};
 use serde_json::{Value as JsonValue, json};
 use vllm_text::Prompt;
 
@@ -40,53 +34,13 @@ use crate::error::{Error, Result};
 use crate::renderer::{ChatRenderer, RenderedPrompt};
 use crate::request::{ChatMessage, ChatRequest};
 
-/// How many conversations a rendering thread keeps the renders of.
-const KEPT_CONVERSATIONS: usize = 32;
-
-/// One conversation as a rendering thread remembers it: the messages of its last request, each
-/// with the value the view was given for it, and the renders the view memoized. A request that
-/// starts with the same messages (the conversation, a turn longer) is given the same values, so
-/// the memoized turns are found again and the render costs what is new.
-struct Conversation {
-    key: u64,
-    used: u64,
-    cache: RunCache,
-    kept: Vec<(ChatMessage, Value)>,
-}
-
-/// A rendering thread: the view and its tokenizer, loaded once, and the conversations it has
-/// rendered lately. The interpreter's values are not shared between threads, so a conversation
-/// always goes to the same thread (by its key).
-struct Worker {
-    enc: Encoder,
-    view: View,
-    special: JsonValue,
-    conversations: Vec<Conversation>,
-    clock: u64,
-}
-
-/// A request, as a rendering thread needs it.
-struct Job {
-    key: u64,
-    messages: Vec<ChatMessage>,
-    /// Everything but the messages, as the template's arguments.
-    rest: JsonValue,
-    reply: mpsc::Sender<std::result::Result<Vec<u32>, Failure>>,
-}
-
-/// Why a render failed: the template raised (the request's fault), or anything else.
-enum Failure {
-    Thrown(String),
-    Other(String),
-}
-
-/// Nanoseconds spent preparing a request's values and rendering them (for the race tests).
-pub(crate) static PREPARE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub(crate) static RENDER_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Renders chat requests to token ids with an Affordance template view.
+///
+/// The rendering itself (its threads, what it keeps of each conversation) is Affordance's
+/// `ChatRenderer`; this is the adapter: the request's messages, tools and template arguments
+/// in the shapes the Hugging Face renderer gives a Jinja template.
 pub struct AffordanceChatRenderer {
-    workers: Vec<mpsc::Sender<Job>>,
+    renderer: affordance::chat_render::ChatRenderer<ChatMessage>,
     default_template_kwargs: HashMap<String, JsonValue>,
 }
 
@@ -115,67 +69,12 @@ fn special_tokens(tokenizer_config: Option<&Path>) -> JsonValue {
     JsonValue::Object(out)
 }
 
-/// A conversation's key: its first two messages (the system prompt alone is shared by many).
-/// Two conversations with the same key share a slot, which costs time, never correctness: a
-/// request is only given the values of messages equal to its own.
-fn conversation_key(messages: &[ChatMessage]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for message in messages.iter().take(2) {
-        format!("{message:?}").hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-impl Worker {
-    fn render(&mut self, job: Job) -> std::result::Result<Vec<u32>, Failure> {
-        let started = std::time::Instant::now();
-        self.clock += 1;
-        let at = match self.conversations.iter().position(|c| c.key == job.key) {
-            Some(at) => at,
-            None => {
-                if self.conversations.len() >= KEPT_CONVERSATIONS {
-                    let oldest = (0..self.conversations.len()).min_by_key(|&i| self.conversations[i].used).unwrap();
-                    self.conversations.swap_remove(oldest);
-                }
-                self.conversations.push(Conversation { key: job.key, used: 0, cache: RunCache::new(true), kept: Vec::new() });
-                self.conversations.len() - 1
-            }
-        };
-        let conversation = &mut self.conversations[at];
-        conversation.used = self.clock;
-        let mut values = Vec::with_capacity(job.messages.len());
-        for (i, message) in job.messages.into_iter().enumerate() {
-            if conversation.kept.get(i).is_some_and(|(kept, _)| *kept == message) {
-                values.push(conversation.kept[i].1.clone());
-                continue;
-            }
-            // No multimodal info: a media part is refused by the conversion.
-            let converted = to_template_message(&message, ChatTemplateContentFormat::String, None)
-                .and_then(|m| serde_json::to_value(&m).map_err(|e| Error::ChatTemplate(e.to_string())))
-                .map_err(|e| Failure::Other(e.to_string()))?;
-            let value = Value::from_json(&converted);
-            conversation.kept.truncate(i);
-            conversation.kept.push((message, value.clone()));
-            values.push(value);
-        }
-        conversation.kept.truncate(values.len());
-        let mut state: Map = (*state_from_json(&job.rest, &self.special)).clone();
-        state.insert(Rc::from("messages"), Value::list(values));
-        let now = chrono::Utc::now().naive_utc();
-        PREPARE_NS.fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        let started = std::time::Instant::now();
-        conversation.cache.next_generation();
-        let rendered = self
-            .view
-            .render(&self.enc, Rc::new(state), &mut conversation.cache, now)
-            // What the official template raises, the view raises: a request error.
-            .map_err(|error| match error.strip_prefix("raise: ") {
-                Some(message) => Failure::Thrown(message.to_owned()),
-                None => Failure::Other(error),
-            })?;
-        RENDER_NS.fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        Ok(rendered.ids)
-    }
+/// A message as a Jinja chat template reads it: the Hugging Face renderer's own conversion.
+/// No multimodal info is given, so a media part is refused, not rendered wrongly.
+fn template_json(message: &ChatMessage) -> std::result::Result<JsonValue, String> {
+    let converted =
+        to_template_message(message, ChatTemplateContentFormat::String, None).map_err(|e| e.to_string())?;
+    serde_json::to_value(&converted).map_err(|e| e.to_string())
 }
 
 impl AffordanceChatRenderer {
@@ -194,48 +93,15 @@ impl AffordanceChatRenderer {
         Ok(renderer)
     }
 
-    /// A renderer for a given view. Its rendering threads are started here, each loading the view
-    /// and the tokenizer; a view that does not load is an error now, not at the first request.
+    /// A renderer for a given view. A view or tokenizer that does not load is an error here.
     pub fn new(view: PathBuf, entry: String, tokenizer: PathBuf, special: JsonValue) -> Result<Self> {
-        let count = std::env::var("VLLM_AFFORDANCE_WORKERS")
-            .ok()
-            .and_then(|n| n.parse().ok())
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get().min(8)));
-        let mut workers = Vec::with_capacity(count);
-        let mut loading = Vec::with_capacity(count);
-        for _ in 0..count.max(1) {
-            let (jobs, inbox) = mpsc::channel::<Job>();
-            let (loaded, load) = mpsc::channel::<std::result::Result<(), String>>();
-            let (view, entry, tokenizer, special) = (view.clone(), entry.clone(), tokenizer.clone(), special.clone());
-            std::thread::Builder::new()
-                .name("affordance-render".to_string())
-                .spawn(move || {
-                    let made = Encoder::from_file(&tokenizer.to_string_lossy())
-                        .and_then(|enc| View::load(&view, &entry, &enc).map(|view| (enc, view)));
-                    let (enc, view) = match made {
-                        Ok(made) => made,
-                        Err(error) => {
-                            let _ = loaded.send(Err(error));
-                            return;
-                        }
-                    };
-                    let _ = loaded.send(Ok(()));
-                    let mut worker = Worker { enc, view, special, conversations: Vec::new(), clock: 0 };
-                    while let Ok(job) = inbox.recv() {
-                        let reply = job.reply.clone();
-                        let _ = reply.send(worker.render(job));
-                    }
-                })
-                .map_err(|e| Error::ChatTemplate(format!("affordance renderer: {e}")))?;
-            workers.push(jobs);
-            loading.push(load);
+        let mut options = affordance::chat_render::Options::new(view, entry, tokenizer);
+        options.special = special;
+        if let Some(workers) = std::env::var("VLLM_AFFORDANCE_WORKERS").ok().and_then(|n| n.parse().ok()) {
+            options.workers = workers;
         }
-        for load in loading {
-            load.recv()
-                .map_err(|_| Error::ChatTemplate("affordance renderer: a rendering thread died".to_string()))?
-                .map_err(Error::ChatTemplate)?;
-        }
-        Ok(Self { workers, default_template_kwargs: HashMap::new() })
+        let renderer = affordance::chat_render::ChatRenderer::new(options, template_json).map_err(Error::ChatTemplate)?;
+        Ok(Self { renderer, default_template_kwargs: HashMap::new() })
     }
 }
 
@@ -254,7 +120,10 @@ impl ChatRenderer for AffordanceChatRenderer {
                 "the affordance renderer does not support documents yet".to_string(),
             ));
         }
-        let tools = (!request.tools().is_empty()).then(|| to_template_tools(request.tools()));
+        let tools = (!request.tools().is_empty())
+            .then(|| serde_json::to_value(to_template_tools(request.tools())))
+            .transpose()
+            .map_err(|e| Error::ChatTemplate(e.to_string()))?;
         let effective_template_kwargs = effective_template_kwargs(&self.default_template_kwargs, request);
         let mut kwargs = serde_json::Map::new();
         for (name, value) in &effective_template_kwargs {
@@ -264,21 +133,14 @@ impl ChatRenderer for AffordanceChatRenderer {
             "add_generation_prompt".to_string(),
             json!(request.chat_options.add_generation_prompt()),
         );
-        let key = conversation_key(&request.messages);
-        let (reply, answer) = mpsc::channel();
-        let job = Job {
-            key,
-            messages: request.messages.clone(),
-            rest: json!({"messages": [], "tools": tools, "kwargs": kwargs}),
-            reply,
-        };
-        let gone = || Error::ChatTemplate("affordance renderer: a rendering thread died".to_string());
-        self.workers[(key % self.workers.len() as u64) as usize].send(job).map_err(|_| gone())?;
-        let ids = answer.recv().map_err(|_| gone())?.map_err(|failure| match failure {
-            Failure::Thrown(message) => Error::ChatTemplateThrown { message },
-            Failure::Other(message) => Error::ChatTemplate(message),
-        })?;
-
+        let ids = self
+            .renderer
+            .render(&request.messages, tools.as_ref(), &JsonValue::Object(kwargs))
+            .map_err(|error| match error {
+                // What the official template raises, the view raises: a request error.
+                affordance::chat_render::RenderError::Raised(message) => Error::ChatTemplateThrown { message },
+                affordance::chat_render::RenderError::Failed(message) => Error::ChatTemplate(message),
+            })?;
         Ok(RenderedPrompt {
             prompt: Prompt::TokenIds(ids),
             media_order: None,
@@ -377,11 +239,6 @@ mod tests {
             ms(jinja_render + jinja_tokenize),
             ms(affordance),
             (jinja_render + jinja_tokenize) as f64 / affordance as f64,
-        );
-        println!(
-            "  affordance inside: preparing values {:.0} ms, render {:.0} ms",
-            super::PREPARE_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
-            super::RENDER_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
         );
         assert_eq!(different, 0, "the two renderers must produce the same ids");
     }
