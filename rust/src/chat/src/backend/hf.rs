@@ -22,6 +22,7 @@ use crate::output::{
     DefaultChatOutputProcessor, HarmonyChatOutputProcessor, validate_harmony_parser_overrides,
 };
 use crate::parser::unified::{HfTemplateError, ResponseTemplate};
+use crate::renderer::hf::affordance::AffordanceChatRenderer;
 use crate::renderer::hf::{HfChatRenderer, MultimodalRenderInfo};
 use crate::renderer::{
     DeepSeekV4ChatRenderer, DeepSeekV32ChatRenderer, DeepSeekV41ChatRenderer, DynChatRenderer,
@@ -78,6 +79,10 @@ impl HfChatBackend {
                 &files,
                 options,
                 multimodal_render_info,
+            )?),
+            RendererSelection::Affordance => Arc::new(AffordanceChatRenderer::from_env(
+                files.tokenizer_config_path.as_deref(),
+                options.default_chat_template_kwargs,
             )?),
             RendererSelection::DeepSeekV32 => Arc::new(DeepSeekV32ChatRenderer::new(
                 options.default_chat_template_kwargs,

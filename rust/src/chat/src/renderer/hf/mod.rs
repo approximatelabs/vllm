@@ -29,6 +29,8 @@ mod generation;
 mod template;
 mod tojson;
 
+pub mod affordance;
+
 pub use template::{load_chat_template, resolve_chat_template};
 
 pub use self::format::ChatTemplateContentFormatOption;

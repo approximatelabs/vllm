@@ -18,6 +18,8 @@ pub enum RendererSelection {
     Auto,
     /// Force the generic Hugging Face chat-template renderer.
     Hf,
+    /// Render with an Affordance template view (chat to token ids, no Jinja).
+    Affordance,
     /// Force the DeepSeek V3.2 renderer.
     DeepSeekV32,
     /// Force the DeepSeek V4 renderer.
@@ -33,6 +35,7 @@ pub enum RendererSelection {
 }
 
 impl RendererSelection {
+    pub const AFFORDANCE_LITERAL: &str = "affordance";
     pub const AUTO_LITERAL: &str = "auto";
     pub const DEEPSEEK_V32_LITERAL: &str = "deepseek_v32";
     pub const DEEPSEEK_V4_LITERAL: &str = "deepseek_v4";
@@ -70,6 +73,8 @@ impl FromStr for RendererSelection {
             Ok(Self::Auto)
         } else if value.eq_ignore_ascii_case(Self::HF_LITERAL) {
             Ok(Self::Hf)
+        } else if value.eq_ignore_ascii_case(Self::AFFORDANCE_LITERAL) {
+            Ok(Self::Affordance)
         } else if value.eq_ignore_ascii_case(Self::DEEPSEEK_V32_LITERAL) {
             Ok(Self::DeepSeekV32)
         } else if value.eq_ignore_ascii_case(Self::DEEPSEEK_V4_LITERAL) {
@@ -96,6 +101,7 @@ impl fmt::Display for RendererSelection {
         match self {
             Self::Auto => f.write_str(Self::AUTO_LITERAL),
             Self::Hf => f.write_str(Self::HF_LITERAL),
+            Self::Affordance => f.write_str(Self::AFFORDANCE_LITERAL),
             Self::DeepSeekV32 => f.write_str(Self::DEEPSEEK_V32_LITERAL),
             Self::DeepSeekV4 => f.write_str(Self::DEEPSEEK_V4_LITERAL),
             Self::DeepSeekV41 => f.write_str(Self::DEEPSEEK_V41_LITERAL),
@@ -128,7 +134,7 @@ mod tests {
     fn renderer_selection_expected_error_message() {
         let err = RendererSelection::from_str("unknown").unwrap_err();
         expect_test::expect![
-            "unknown renderer `unknown` (expected one of: auto, hf, deepseek_v32, deepseek_v4, deepseek_v41, harmony, inkling, kimi_k3)"
+            "unknown renderer `unknown` (expected one of: auto, hf, affordance, deepseek_v32, deepseek_v4, deepseek_v41, harmony, inkling, kimi_k3)"
         ]
         .assert_eq(&err);
     }
