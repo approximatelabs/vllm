@@ -44,6 +44,9 @@ _MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS: set[str] = {
 }
 
 _VLLM_TOKENIZERS = {
+    # Affordance replaces only the renderer (chat to token ids); token operations use the
+    # plain HF tokenizer.
+    "affordance": ("hf", "CachedHfTokenizer"),
     "alpamayo2_super": ("alpamayo2_super", "Alpamayo2SuperTokenizer"),
     # ``cohere`` mode uses the standard cached HF tokenizer; only the
     # renderer (template stage) is replaced with a melody-based one.

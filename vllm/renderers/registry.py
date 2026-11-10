@@ -20,6 +20,7 @@ logger = init_logger(__name__)
 
 
 _VLLM_RENDERERS = {
+    "affordance": ("affordance", "AffordanceRenderer"),
     "alpamayo2_super": ("hf", "HfRenderer"),
     "cohere": ("cohere", "CohereRenderer"),
     "deepseek_v32": ("deepseek_v32", "DeepseekV32Renderer"),
