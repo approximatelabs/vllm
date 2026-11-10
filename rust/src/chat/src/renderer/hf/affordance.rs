@@ -22,17 +22,19 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use affordance::emit::{Encoder, RunCache};
+use affordance::value::{Map, Value};
 use affordance::{View, state_from_json};
 use serde_json::{Value as JsonValue, json};
 use vllm_text::Prompt;
 
 use super::format::ChatTemplateContentFormat;
-use super::{effective_template_kwargs, to_template_messages, to_template_tools};
+use super::{effective_template_kwargs, to_template_message, to_template_tools};
 use crate::error::{Error, Result};
 use crate::renderer::{ChatRenderer, RenderedPrompt};
-use crate::request::ChatRequest;
+use crate::request::{ChatMessage, ChatRequest};
 
 /// A view, its tokenizer and its render cache. The interpreter's values are not shared between
 /// threads, so each rendering thread loads its own.
@@ -40,7 +42,16 @@ struct Loaded {
     enc: Encoder,
     view: View,
     cache: RunCache,
+    /// The messages of the last request rendered here, each with the value the view was given
+    /// for it. A request that starts with the same messages (a conversation one turn longer) is
+    /// given the same values, so what the view memoized for them is found again and the render
+    /// costs what is new. One conversation a thread for now; a server needs a small table.
+    kept: Vec<(ChatMessage, Value)>,
 }
+
+/// Nanoseconds spent preparing a request's values and rendering them (for the race test).
+pub(crate) static PREPARE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static RENDER_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 thread_local! {
     static LOADED: RefCell<HashMap<PathBuf, Loaded>> = RefCell::new(HashMap::new());
@@ -109,7 +120,7 @@ impl AffordanceChatRenderer {
         let tokenizer = self.tokenizer.to_string_lossy();
         let enc = Encoder::from_file(&tokenizer).map_err(Error::ChatTemplate)?;
         let view = View::load(&self.view, &self.entry, &enc).map_err(Error::ChatTemplate)?;
-        Ok(Loaded { enc, view, cache: RunCache::new(true) })
+        Ok(Loaded { enc, view, cache: RunCache::new(true), kept: Vec::new() })
     }
 }
 
@@ -128,8 +139,6 @@ impl ChatRenderer for AffordanceChatRenderer {
                 "the affordance renderer does not support documents yet".to_string(),
             ));
         }
-        // No multimodal info: a media part is refused by the conversion.
-        let messages = to_template_messages(&request.messages, ChatTemplateContentFormat::String, None)?;
         let tools = (!request.tools().is_empty()).then(|| to_template_tools(request.tools()));
         let effective_template_kwargs = effective_template_kwargs(&self.default_template_kwargs, request);
         let mut kwargs = serde_json::Map::new();
@@ -140,7 +149,8 @@ impl ChatRenderer for AffordanceChatRenderer {
             "add_generation_prompt".to_string(),
             json!(request.chat_options.add_generation_prompt()),
         );
-        let case = json!({"messages": messages, "tools": tools, "kwargs": kwargs});
+        // Everything but the messages, as the template's arguments.
+        let rest = json!({"messages": [], "tools": tools, "kwargs": kwargs});
 
         let ids = LOADED.with(|loaded| -> Result<Vec<u32>> {
             let mut loaded = loaded.borrow_mut();
@@ -148,15 +158,37 @@ impl ChatRenderer for AffordanceChatRenderer {
                 loaded.insert(self.view.clone(), self.load()?);
             }
             let l = loaded.get_mut(&self.view).expect("loaded above");
-            let state = state_from_json(&case, &self.special);
+            let started = std::time::Instant::now();
+            let mut values = Vec::with_capacity(request.messages.len());
+            for (i, message) in request.messages.iter().enumerate() {
+                if l.kept.get(i).is_some_and(|(kept, _)| kept == message) {
+                    values.push(l.kept[i].1.clone());
+                    continue;
+                }
+                // No multimodal info: a media part is refused by the conversion.
+                let converted = to_template_message(message, ChatTemplateContentFormat::String, None)?;
+                let value = Value::from_json(
+                    &serde_json::to_value(&converted).map_err(|e| Error::ChatTemplate(e.to_string()))?,
+                );
+                l.kept.truncate(i);
+                l.kept.push((message.clone(), value.clone()));
+                values.push(value);
+            }
+            l.kept.truncate(request.messages.len());
+            let mut state: Map = (*state_from_json(&rest, &self.special)).clone();
+            state.insert(Rc::from("messages"), Value::list(values));
             let now = chrono::Utc::now().naive_utc();
-            let rendered = l.view.render(&l.enc, state, &mut l.cache, now).map_err(|error| {
+            PREPARE_NS.fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            let started = std::time::Instant::now();
+            l.cache.next_generation();
+            let rendered = l.view.render(&l.enc, Rc::new(state), &mut l.cache, now).map_err(|error| {
                 // What the official template raises, the view raises: a request error.
                 match error.strip_prefix("raise: ") {
                     Some(message) => Error::ChatTemplateThrown { message: message.to_owned() },
                     None => Error::ChatTemplate(error),
                 }
             })?;
+            RENDER_NS.fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             Ok(rendered.ids)
         })?;
 
@@ -218,6 +250,11 @@ mod tests {
         let tokenizer = HuggingFaceTokenizer::new(&dir.join("tokenizer.json")).unwrap();
         let ours = AffordanceChatRenderer::new(view, entry, tokenizer_json, special).unwrap();
 
+        // Both sides loaded before the clock starts: the view and its tokenizer are loaded on the
+        // rendering thread at its first request, which is start-up, not rendering.
+        let warm = request(vec![ChatMessage::user("warm up".to_string())]);
+        jinja.render(&warm).unwrap();
+        ours.render(&warm).unwrap();
         let text = "The quick brown fox jumps over the lazy dog. ".repeat(40);
         let mut turns = vec![ChatMessage::system("You are a careful coding assistant.")];
         let (mut jinja_render, mut jinja_tokenize, mut affordance) = (0u128, 0u128, 0u128);
@@ -253,6 +290,11 @@ mod tests {
             ms(jinja_render + jinja_tokenize),
             ms(affordance),
             (jinja_render + jinja_tokenize) as f64 / affordance as f64,
+        );
+        println!(
+            "  affordance inside: preparing values {:.0} ms, render {:.0} ms",
+            super::PREPARE_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+            super::RENDER_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
         );
         assert_eq!(different, 0, "the two renderers must produce the same ids");
     }
