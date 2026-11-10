@@ -80,10 +80,16 @@ impl HfChatBackend {
                 options,
                 multimodal_render_info,
             )?),
-            RendererSelection::Affordance => Arc::new(AffordanceChatRenderer::from_env(
-                files.tokenizer_config_path.as_deref(),
-                options.default_chat_template_kwargs,
-            )?),
+            RendererSelection::Affordance => {
+                let default_kwargs = options.default_chat_template_kwargs.clone();
+                // The model's own Jinja renderer, for what the view does not render.
+                let fallback = HfChatRenderer::load(&files, options, multimodal_render_info).ok();
+                Arc::new(AffordanceChatRenderer::from_env(
+                    files.tokenizer_config_path.as_deref(),
+                    default_kwargs,
+                    fallback,
+                )?)
+            }
             RendererSelection::DeepSeekV32 => Arc::new(DeepSeekV32ChatRenderer::new(
                 options.default_chat_template_kwargs,
             )),
