@@ -316,6 +316,66 @@ mod tests {
         );
         assert_eq!(different, 0, "the two renderers must produce the same ids");
     }
+    /// The worst case for a renderer that remembers: every request is a conversation it has
+    /// never seen (more of them than it keeps), so nothing is reused. One request each.
+    #[test]
+    #[ignore = "needs AFFORDANCE_ROOT and AFFORDANCE_MODEL"]
+    fn affordance_race_cold() {
+        let root = PathBuf::from(std::env::var("AFFORDANCE_ROOT").unwrap());
+        let model = std::env::var("AFFORDANCE_MODEL").unwrap();
+        let index: JsonValue =
+            serde_json::from_str(&std::fs::read_to_string(root.join("views/index.json")).unwrap()).unwrap();
+        let view = root.join("views").join(index[&model]["view"].as_str().unwrap());
+        let entry = index[&model]["entry"].as_str().unwrap().to_string();
+        let dir = root.join("ref/models").join(&model);
+        let special: JsonValue = serde_json::from_str(
+            &std::fs::read_to_string(root.join(format!("ref/tokenizers/{model}.special.json"))).unwrap(),
+        )
+        .unwrap();
+        let config = load_tokenizer_config(Some(&dir.join("tokenizer_config.json"))).unwrap();
+        let template = load_chat_template(&dir.join("chat_template.jinja")).unwrap().or(config.chat_template);
+        let jinja = HfChatRenderer::new(template, HashMap::new(), ChatTemplateContentFormatOption::Auto)
+            .unwrap()
+            .with_special_tokens(Some(config.special_tokens));
+        let tokenizer = HuggingFaceTokenizer::new(&dir.join("tokenizer.json")).unwrap();
+        let ours =
+            AffordanceChatRenderer::new(view, entry, root.join(format!("ref/tokenizers/{model}.json")), special).unwrap();
+        let warm = request(vec![ChatMessage::user("warm up".to_string())]);
+        jinja.render(&warm).unwrap();
+        ours.render(&warm).unwrap();
+
+        // (turn pairs, conversations): about 1k, 16k and 130k tokens a prompt.
+        for (pairs, conversations) in [(1usize, 3072usize), (20, 512), (160, 96)] {
+            let (mut baseline, mut affordance, mut different, mut tokens) = (0u128, 0u128, 0, 0usize);
+            for c in 0..conversations {
+                let text = format!("Conversation {c} of {pairs}: the quick brown fox {c} jumps over the lazy dog. ").repeat(30);
+                let mut messages = vec![ChatMessage::system(format!("You are careful coding assistant number {c}."))];
+                for i in 0..pairs {
+                    messages.push(ChatMessage::user(format!("Step {i}: {text}")));
+                    messages.push(ChatMessage::assistant_text(format!("Done with step {i}. {text}")));
+                }
+                messages.push(ChatMessage::user("continue".to_string()));
+                let request = request(messages);
+                let t = Instant::now();
+                let prompt = jinja.render(&request).unwrap().prompt.into_text().unwrap();
+                let want = tokenizer.encode(&prompt, false).unwrap();
+                baseline += t.elapsed().as_nanos();
+                let t = Instant::now();
+                let got = ours.render(&request).unwrap().prompt.into_token_ids().unwrap();
+                affordance += t.elapsed().as_nanos();
+                different += usize::from(got != want);
+                tokens = want.len();
+            }
+            println!(
+                "{model}: {conversations} conversations never seen before, one request each of {tokens} tokens; different on {different}\n  \
+                 minijinja + tokenize {:.2} ms a request   affordance {:.2} ms a request   {:.2}x",
+                baseline as f64 / 1e6 / conversations as f64,
+                affordance as f64 / 1e6 / conversations as f64,
+                baseline as f64 / affordance as f64,
+            );
+            assert_eq!(different, 0, "the two renderers must produce the same ids");
+        }
+    }
     /// A tool-using agent: tools declared, and each step a user message, an assistant turn that
     /// calls a tool (its arguments a JSON string, as a client sends them), the tool's result and
     /// the assistant's answer. The templates' most intricate paths, and the ids must still be
