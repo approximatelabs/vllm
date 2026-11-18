@@ -1,3 +1,5 @@
+> **This is Approximate Labs' fork of vLLM 0.33.0, where Affordance builds the server's prompts. See [AFFORDANCE.md](AFFORDANCE.md).** The rest of this README is upstream's.
+
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>

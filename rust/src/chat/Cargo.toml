@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 # Prototype: the Affordance renderer (a checkout beside this repository).
-affordance = { path = "../../../../affordance", default-features = false }
+affordance = { version = "0.1.0", default-features = false }
 anyhow.workspace = true
 asynk-strim-attr.workspace = true
 chrono.workspace = true

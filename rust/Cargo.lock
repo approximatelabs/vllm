@@ -11,6 +11,8 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "affordance"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4402668a00c771a0e3d7752bdf61a69f25851af333d9c8b2d5cdb6dd1f5e5185"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -20,14 +22,15 @@ dependencies = [
  "itoa",
  "libm",
  "memmap2",
+ "png",
  "regex",
- "regex-automata",
  "serde",
  "serde-saphyr",
  "serde_json",
  "sha2",
  "stacker",
  "tokenizers 0.23.2",
+ "zune-jpeg",
 ]
 
 [[package]]
